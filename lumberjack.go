@@ -36,6 +36,7 @@ import (
 )
 
 const (
+	createTimeFormat = "2006-01-02"
 	backupTimeFormat = "2006-01-02T15-04-05.000"
 	compressSuffix   = ".gz"
 	defaultMaxSize   = 100
@@ -86,6 +87,10 @@ type Logger struct {
 	// rotated. It defaults to 100 megabytes.
 	MaxSize int `json:"maxsize" yaml:"maxsize"`
 
+	// MaxDays is the maximum days of the log file before it gets
+	// rotated.
+	MaxDays int `json:"maxdays" yaml:"maxdays"`
+
 	// MaxAge is the maximum number of days to retain old log files based on the
 	// timestamp encoded in their filename.  Note that a day is defined as 24
 	// hours and may not exactly correspond to calendar days due to daylight
@@ -110,6 +115,8 @@ type Logger struct {
 	size int64
 	file *os.File
 	mu   sync.Mutex
+
+	time time.Time
 
 	millCh    chan bool
 	startMill sync.Once
@@ -149,7 +156,12 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	if l.size+writeLen > l.max() {
+	ct := currentTime()
+	if !l.LocalTime {
+		ct = ct.UTC()
+	}
+	nt := l.time.Add(24 * time.Hour * time.Duration(l.MaxDays))
+	if l.size+writeLen > l.max() || (l.MaxDays > 0 && ct.After(nt)) {
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
@@ -211,14 +223,14 @@ func (l *Logger) openNew() error {
 		return fmt.Errorf("can't make directories for new logfile: %s", err)
 	}
 
-	name := l.filename()
+	name, ct := backupName(l.filename(), createTimeFormat, l.LocalTime)
 	mode := os.FileMode(0600)
 	info, err := os_Stat(name)
 	if err == nil {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
 		// move the existing file
-		newname := backupName(name, l.LocalTime)
+		newname, _ := backupName(name, backupTimeFormat, l.LocalTime)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
@@ -238,24 +250,28 @@ func (l *Logger) openNew() error {
 	}
 	l.file = f
 	l.size = 0
+	l.time = ct
 	return nil
 }
 
 // backupName creates a new filename from the given name, inserting a timestamp
 // between the filename and the extension, using the local time if requested
 // (otherwise UTC).
-func backupName(name string, local bool) string {
+func backupName(name, timeFormat string, local bool) (string, time.Time) {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	ext := filepath.Ext(filename)
 	prefix := filename[:len(filename)-len(ext)]
 	t := currentTime()
+	tz := time.Local
 	if !local {
 		t = t.UTC()
+		tz = time.UTC
 	}
 
-	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	timestamp := t.Format(timeFormat)
+	ct := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, tz)
+	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext)), ct
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
@@ -264,7 +280,7 @@ func backupName(name string, local bool) string {
 func (l *Logger) openExistingOrNew(writeLen int) error {
 	l.mill()
 
-	filename := l.filename()
+	filename, ct := backupName(l.filename(), createTimeFormat, l.LocalTime)
 	info, err := os_Stat(filename)
 	if os.IsNotExist(err) {
 		return l.openNew()
@@ -285,6 +301,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	}
 	l.file = file
 	l.size = info.Size()
+	l.time = ct
 	return nil
 }
 
